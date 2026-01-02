@@ -4,8 +4,13 @@ sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 
 import streamlit as st
 from dotenv import load_dotenv
+
+load_dotenv()
+
+from uuid import uuid4
+
 from back import get_ai_response
-from mongo import save_chat_log
+from mongoDB import insert_chat_log, update_feedback
 
 
 st.set_page_config(page_title="TITAN_CHAT", page_icon="⚔️")
@@ -13,10 +18,12 @@ st.set_page_config(page_title="TITAN_CHAT", page_icon="⚔️")
 st.title("All About 진격의 거인")
 st.caption("진격거에 관련된 모든것을 답해드립니다!")
 
-load_dotenv()
-
 if 'message_list' not in st.session_state:
     st.session_state.message_list = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid4())
+if "feedback_by_log_id" not in st.session_state:
+    st.session_state.feedback_by_log_id = {}
 
 for message in st.session_state.message_list:
     with st.chat_message(message["role"]):
@@ -30,52 +37,48 @@ if user_question := st.chat_input(placeholder="진격거에 관련된 궁금한 
         st.write(user_question)
     st.session_state.message_list.append({"role": "user", "content": user_question})
 
-    with st.chat_message("ai"):
-        with st.spinner("답변을 생성하는 중입니다"):
-            full_response = ""
-            retrieved_docs = []
-            
-            response_container = st.empty()
-            for chunk in get_ai_response(user_question):
-                if "context" in chunk:
-                    retrieved_docs = [doc.page_content for doc in chunk["context"]]
-                if "answer" in chunk:
-                    full_response += chunk["answer"]
-                    response_container.write(full_response)
-            
-            st.session_state.message_list.append({"role": "ai", "content": full_response})
-            
-            # 데이터를 세션에 명확히 저장
-            st.session_state.last_query = user_question
-            st.session_state.last_response = full_response
-            st.session_state.last_context = retrieved_docs
-            # 답변이 완료되었음을 알리는 플래그
-            st.session_state.show_feedback = True
+    with st.spinner("답변을 생성하는 중입니다"):
+        ai_response, retrieved_context = get_ai_response(
+            user_question, st.session_state.session_id
+        )
+        with st.chat_message("ai"):
+            ai_message = st.write_stream(ai_response)
+            # print(st.session_state.message_list)
+            st.session_state.message_list.append({"role": "ai", "content": ai_message})
+        try:
+            result = insert_chat_log(
+                session_id=st.session_state.session_id,
+                user_query=user_question,
+                ai_response=ai_message,
+                retrieved_context=retrieved_context,
+            )
+            log_id = str(result.inserted_id)
+            st.session_state.last_log_id = log_id
+            st.session_state.message_list[-1]["log_id"] = log_id
+        except Exception as exc:
+            st.warning(f"MongoDB 저장에 실패했습니다: {exc}")
 
-# --- 이 부분이 블록 밖으로 나와야 합니다 ---
-if st.session_state.get("show_feedback"):
-    feedback_key = f"feedback_{len(st.session_state.message_list)}"
-    
-    col1, col2, _ = st.columns([0.1, 0.1, 0.8])
-    with col1:
-        if st.button("👍", key=f"up_{feedback_key}"):
-            res = save_chat_log(
-                st.session_state.last_query,
-                st.session_state.last_response,
-                st.session_state.last_context,
-                "good"
-            )
-            if res:
-                st.success("피드백이 DB에 저장되었습니다!")
-                st.session_state.show_feedback = False # 중복 저장 방지
-    with col2:
-        if st.button("👎", key=f"down_{feedback_key}"):
-            res = save_chat_log(
-                st.session_state.last_query,
-                st.session_state.last_response,
-                st.session_state.last_context,
-                "bad"
-            )
-            if res:
-                st.error("피드백이 기록되었습니다.")
-                st.session_state.show_feedback = False
+if "last_log_id" in st.session_state:
+    log_id = st.session_state.last_log_id
+    existing_feedback = st.session_state.feedback_by_log_id.get(log_id)
+    if existing_feedback:
+        st.caption(f"피드백 저장됨: {existing_feedback}")
+    else:
+        st.write("답변이 도움이 되었나요?")
+        like_col, dislike_col = st.columns(2)
+        with like_col:
+            if st.button("좋아요", key=f"like_{log_id}"):
+                try:
+                    update_feedback(log_id=log_id, feedback="like")
+                    st.session_state.feedback_by_log_id[log_id] = "like"
+                    st.rerun()
+                except Exception as exc:
+                    st.warning(f"피드백 저장에 실패했습니다: {exc}")
+        with dislike_col:
+            if st.button("싫어요", key=f"dislike_{log_id}"):
+                try:
+                    update_feedback(log_id=log_id, feedback="dislike")
+                    st.session_state.feedback_by_log_id[log_id] = "dislike"
+                    st.rerun()
+                except Exception as exc:
+                    st.warning(f"피드백 저장에 실패했습니다: {exc}")
