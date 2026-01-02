@@ -4,6 +4,9 @@ sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 
 import streamlit as st
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from back import get_ai_response
 
 
@@ -11,8 +14,6 @@ st.set_page_config(page_title="TITAN_CHAT", page_icon="⚔️")
 
 st.title("All About 진격의 거인")
 st.caption("진격거에 관련된 모든것을 답해드립니다!")
-
-load_dotenv()
 
 if 'message_list' not in st.session_state:
     st.session_state.message_list = []

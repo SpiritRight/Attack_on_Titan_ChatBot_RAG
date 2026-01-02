@@ -11,7 +11,11 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.llms import Ollama
 
+from dotenv import load_dotenv
+
 from config import answer_examples
+
+load_dotenv()
 
 
 
