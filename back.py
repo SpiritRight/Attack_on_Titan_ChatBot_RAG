@@ -40,7 +40,7 @@ def get_embeddings():
 def get_retriever():
     # database = Chroma(collection_name='chroma-inu-new', persist_directory="./chroma_inu-new", embedding_function=get_embeddings())
     database = Chroma(collection_name='AoT', persist_directory="./AoT", embedding_function=get_embeddings())
-    retriever = database.as_retriever(search_kwargs={'k': 4})   
+    retriever = database.as_retriever(search_kwargs={'k': 8})   
     return retriever
 
 def get_history_retriever():
