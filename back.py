@@ -12,6 +12,7 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_upstage import ChatUpstage, UpstageEmbeddings
 from dotenv import load_dotenv
 
+
 from config import answer_examples
 
 load_dotenv()
@@ -19,6 +20,11 @@ load_dotenv()
 
 
 store = {}
+
+RELATIONSHIP_KEYWORDS = [
+    "관계", "사이", "좋아해", "호감", "짝사랑", "연애", "결혼", "친구", "동료", 
+    "유대", "감정", "심리", "커플", "러브라인", "호칭"
+]
 
 REPLACEMENTS = {
     "사람을 나타내는 표현": "진격의거인 애니메이션 안의 등장인물이나 사람들",
@@ -69,50 +75,40 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 def get_embeddings():
     return UpstageEmbeddings(model='solar-embedding-1-large')
 
-
+# 1. Chroma DB 객체만 캐싱합니다 (이 객체는 인자가 없어 에러가 나지 않습니다)
 @lru_cache(maxsize=1)
 def get_vectorstore():
-    # database = Chroma(collection_name='chroma-inu-new', persist_directory="./chroma_inu-new", embedding_function=get_embeddings())
     return Chroma(
-        collection_name='AoT',
-        persist_directory="./AoT",
-        embedding_function=get_embeddings(),
+        collection_name='AoT', 
+        persist_directory="./AoT", 
+        embedding_function=get_embeddings()
     )
 
 
-def get_retriever(metadata_filter: dict | None = None):
-    search_kwargs = {"k": 6, "fetch_k": 24}
-    if metadata_filter:
-        search_kwargs["filter"] = metadata_filter
-    return get_vectorstore().as_retriever(
-        search_type="mmr",
-        search_kwargs=search_kwargs,
-    )
+# 2. 리트리버 함수에서는 @lru_cache를 제거합니다. 
+# 대신 위에서 캐싱된 vectorstore를 사용하므로 속도는 여전히 빠릅니다.
+def get_retriever(search_filter: dict = None):
+    database = get_vectorstore()
+    return database.as_retriever(search_kwargs={'k': 4, 'filter': search_filter})
 
-def get_history_retriever(metadata_filter: dict | None = None):
+# 3. 히스토리 리트리버도 캐시 없이 호출되도록 합니다.
+def get_history_retriever(search_filter: dict = None):
     llm = get_llm()
-    retriever = get_retriever(metadata_filter)
+    retriever = get_retriever(search_filter)
     
     contextualize_q_system_prompt = (
         "Given a chat history and the latest user question "
         "which might reference context in the chat history, "
         "formulate a standalone question which can be understood "
-        "without the chat history. Do NOT answer the question, "
-        "just reformulate it if needed and otherwise return it as is."
+        "without the chat history."
     )
-
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
     
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
-    return history_aware_retriever
+    return create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
 
 
 def get_llm(model='solar-pro2'):
@@ -126,64 +122,38 @@ def normalize_question(question: str) -> str:
         normalized = normalized.replace(source, target)
     return normalized
 
-
-def _allow_table_docs(question: str) -> bool:
-    if not question:
-        return False
-    if TABLE_ALLOWED_PATTERN.search(question):
-        return True
-    for keyword in TABLE_ALLOWED_KEYWORDS:
-        if keyword in question:
-            return True
-    return False
-
-
-def _is_table_or_titleless(doc) -> bool:
-    text = (doc.page_content or "")
-    metadata = doc.metadata or {}
-    section = metadata.get("section") or ""
-    return "[TABLE]" in text or "섹션: 제목 없음" in text or section == "제목 없음"
-
-
-def _allow_spinoff_docs(question: str) -> bool:
-    if not question:
-        return False
-    return "외전" in question or "거인 중학교" in question
-
-
-def _is_spinoff_doc(doc) -> bool:
-    metadata = doc.metadata or {}
-    title = (metadata.get("title") or "")
-    return "거인 중학교" in title
-
-
-def _build_metadata_filter(question: str) -> dict | None:
-    if _allow_spinoff_docs(question):
-        return None
-    return {"is_spinoff": False}
-
-
-def _filter_retrieved_docs(question: str, docs):
-    if not _allow_spinoff_docs(question):
-        docs = [doc for doc in docs if not _is_spinoff_doc(doc)]
-    if _allow_table_docs(question):
-        return docs
-    filtered = [doc for doc in docs if not _is_table_or_titleless(doc)]
-    if filtered:
-        return filtered
-    return docs
-
-
 def _sanitize_metadata(metadata: dict) -> dict:
-    if not metadata:
-        return {}
-    cleaned = {}
-    for key, value in metadata.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            cleaned[key] = value
-        else:
-            cleaned[key] = str(value)
-    return cleaned
+    if not metadata: return {}
+    return {k: (v if isinstance(v, (str, int, float, bool)) or v is None else str(v)) 
+            for k, v in metadata.items()}
+
+def retrieve_docs(question: str, session_id: str):
+    """
+    질문을 분석하여 프리 필터링 조건을 설정하고 문서를 검색합니다.
+    """
+    # 1. 관계 관련 질문인지 확인
+    is_relational = any(keyword in question for keyword in RELATIONSHIP_KEYWORDS)
+    
+    # 2. 프리 필터링 조건 설정
+    search_filter = None
+    if is_relational:
+        # 관계 질문일 경우: is_table이 False 이고 is_quote가 False인 것만 검색
+        search_filter = {
+            "$and": [
+                {"is_table": {"$eq": False}},
+                {"is_quote": {"$eq": False}}
+            ]
+        }
+    
+    history = get_session_history(session_id)
+    
+    if len(history.messages) >= 2:
+        h_retriever = get_history_retriever(search_filter)
+        docs = h_retriever.invoke({"input": question, "chat_history": history.messages})
+    else:
+        docs = get_retriever(search_filter).invoke(question)
+        
+    return docs
 
 
 def get_answer_chain():
@@ -210,27 +180,6 @@ def get_answer_chain():
     [중요 규칙 2 - 이름 및 용어 표기 통일]
     사용자가 번역 차이, 음역 차이, 오타, 별칭 등으로 질문하더라도
     아래의 대응 관계를 자동으로 동일 개체로 인식해야 합니다.
-
-    
-    당신은 애니메이션 및 원작 만화 『진격의 거인』(Attack on Titan)의
-    설정, 스토리, 인물, 세계관에 대해 정확하고 깊이 있는 지식을 가진 전문가입니다.
-
-    ────────────────────────────────
-    [중요 규칙 1 - 답변 범위 제한]
-    사용자의 질문이 『진격의 거인』 작품 내용,
-    작가(이사야마 하지메), 성우, 제작사, 세계관, 설정, 인물, 사건 등
-    작품과 직접적으로 관련된 경우에만 답변하십시오.
-
-    작품과 전혀 무관한 질문(예: 날씨, 수학 문제, 타 작품 등)에는
-    반드시 다음 문장으로만 답변하십시오.
-    "모르겠습니다. 진격의 거인과 관련된 질문만 답변할 수 있습니다."
-    ────────────────────────────────
-
-    [중요 규칙 2 - 이름 및 용어 표기 통일]
-    사용자가 번역 차이, 음역 차이, 오타, 별칭 등을 사용하더라도
-    아래 대응 관계를 자동으로 동일 개체로 인식해야 합니다.
-
-    단, 답변에서는 반드시 한국 공식 번역 기준의 정식 명칭만 사용하십시오.
 
     ── 인물 ──
     - 에렌 예거: 에렌, 엘런, 엘렌, 엘런 예거, 엘렌 예거, Eren, Yeager, Jaeger
@@ -263,17 +212,6 @@ def get_answer_chain():
 
     - 아커만 가문: 아커맨 가문, 액커맨 가문, 아커만 가문
 
-    [중요 규칙 3]
-    인물, 사건, 설정에 대해 답변할 때는
-    - 작중 시점
-    - 애니메이션 / 만화 기준 여부
-    - 명확히 밝혀진 설정과 해석의 영역을 구분
-    하여 서술하십시오.
-
-    [중요 규칙 4]
-    질문이 들어오면 답변을 찾을 때 주어와 목적어를 엄격하게 구분하여서 확실하게 대답하세요.
-
-    - 아커만 가문: 아커맨 가문, 액커맨 가문
     ────────────────────────────────
 
     [중요 규칙 3 - 서술 구조]
@@ -335,66 +273,33 @@ def get_answer_chain():
     return question_answer_chain
 
 
-def get_retrieved_context(user_message: str, session_id: str):
-    normalized_question = normalize_question(user_message)
-    docs = retrieve_docs(normalized_question, session_id)
-    return [
-        {
-            "text": doc.page_content,
-            "metadata": _sanitize_metadata(doc.metadata),
-        }
-        for doc in docs
-    ]
-
-
-def retrieve_docs(question: str, session_id: str):
-    history = get_session_history(session_id)
-    metadata_filter = _build_metadata_filter(question)
-    if len(history.messages) >= 2:
-        history_aware_retriever = get_history_retriever(metadata_filter)
-        docs = history_aware_retriever.invoke(
-            {"input": question, "chat_history": history.messages}
-        )
-        if metadata_filter and not docs:
-            history_aware_retriever = get_history_retriever()
-            docs = history_aware_retriever.invoke(
-                {"input": question, "chat_history": history.messages}
-            )
-        return _filter_retrieved_docs(question, docs)
-    docs = get_retriever(metadata_filter).invoke(question)
-    if metadata_filter and not docs:
-        docs = get_retriever().invoke(question)
-    return _filter_retrieved_docs(question, docs)
-
-
-def _stream_answer(chain, inputs: dict, history: BaseChatMessageHistory, user_message: str):
-    buffer = []
-    for chunk in chain.stream(inputs):
-        buffer.append(chunk)
-        yield chunk
-    answer = "".join(buffer)
-    history.add_user_message(user_message)
-    history.add_ai_message(answer)
-
-
 def get_ai_response(user_message, session_id: str = "abc123"):
     normalized_question = normalize_question(user_message)
+    
+    # 문서 검색 (프리 필터링 적용됨)
     docs = retrieve_docs(normalized_question, session_id)
     retrieved_context = [
-        {
-            "text": doc.page_content,
-            "metadata": _sanitize_metadata(doc.metadata),
-        }
+        {"text": doc.page_content, "metadata": _sanitize_metadata(doc.metadata)}
         for doc in docs
     ]
 
     history = get_session_history(session_id)
     answer_chain = get_answer_chain()
+    
     inputs = {
         "input": normalized_question,
         "context": docs,
         "chat_history": history.messages,
     }
-    ai_response = _stream_answer(answer_chain, inputs, history, user_message)
+    
+    # 스트리밍 답변 생성
+    def _stream_answer():
+        buffer = []
+        for chunk in answer_chain.stream(inputs):
+            buffer.append(chunk)
+            yield chunk
+        answer = "".join(buffer)
+        history.add_user_message(user_message)
+        history.add_ai_message(answer)
 
-    return ai_response, retrieved_context
+    return _stream_answer(), retrieved_context

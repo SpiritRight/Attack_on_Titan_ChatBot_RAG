@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from back import get_ai_response
+from back_1 import get_ai_response
 from mongoDB import insert_chat_log, update_feedback
 
 
